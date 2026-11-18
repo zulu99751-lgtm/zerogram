@@ -1,0 +1,108 @@
+name: Build ZeroGram APK
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Unpack & Normalize Project Archive
+        run: |
+          for z in *.zip; do
+            if [ -f "$z" ]; then
+              echo "Unpacking $z..."
+              unzip -q -o "$z"
+            fi
+          done
+          if [ ! -f "settings.gradle.kts" ] && [ -f "zerogram/settings.gradle.kts" ]; then
+            cp -rf zerogram/* .
+          fi
+          python3 - << 'PY'
+          from pathlib import Path
+          toml = Path("gradle/libs.versions.toml")
+          if toml.exists():
+              txt = toml.read_text()
+              txt = txt.replace('composeBom = "2026.09.00"', 'composeBom = "2026.06.01"')
+              txt = txt.replace('activityCompose = "1.11.0"', 'activityCompose = "1.12.4"')
+              toml.write_text(txt)
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install Android SDK 34/36 & CMake 3.22.1
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1"
+
+      - name: Cache Prebuilt TDLib arm64-v8a
+        id: tdlib-cache
+        uses: actions/cache@v4
+        with:
+          path: .tdlib-arm64-prebuilt
+          key: tdlib-android-arm64-v8a-api26-v3
+
+      - name: Build Official TDLib (arm64-v8a) on First Run
+        if: steps.tdlib-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake gperf ninja-build php-cli perl wget unzip zip
+          git clone --depth 1 https://github.com/tdlib/td.git /tmp/td
+          cd /tmp/td/example/android
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          NDK_VER=$(ls -1 "$ANDROID_HOME/ndk" | sort -V | tail -n 1)
+          ./build-openssl.sh "$ANDROID_HOME" "$NDK_VER"
+          ./build-tdlib.sh "$ANDROID_HOME" "$NDK_VER" "" "" "" "26" "arm64-v8a"
+          mkdir -p "$GITHUB_WORKSPACE/.tdlib-arm64-prebuilt/arm64-v8a"
+          mkdir -p "$GITHUB_WORKSPACE/.tdlib-arm64-prebuilt/java"
+          cp tdlib/libs/arm64-v8a/*.so "$GITHUB_WORKSPACE/.tdlib-arm64-prebuilt/arm64-v8a/"
+          cp -r tdlib/java/org "$GITHUB_WORKSPACE/.tdlib-arm64-prebuilt/java/"
+
+      - name: Inject TDLib Binary & Generated TdApi.java
+        run: |
+          mkdir -p core/tdlib/src/main/jniLibs/arm64-v8a
+          cp .tdlib-arm64-prebuilt/arm64-v8a/*.so core/tdlib/src/main/jniLibs/arm64-v8a/
+          cp -r .tdlib-arm64-prebuilt/java/org core/tdlib/src/main/java/
+
+      - name: Setup Gradle 8.14
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14"
+
+      - name: Assemble Signed ZeroGram APK
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          gradle :app:assembleRelease :app:assembleDebug -Dorg.gradle.daemon=false
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/ZeroGram-arm64-v8a.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/ZeroGram-arm64-v8a-debug.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroGram-APK
+          path: dist/ZeroGram-arm64-v8a.apk
+          compression-level: 0
+
+      - name: Publish Direct Install APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "ZeroGram APK #${{ github.run_number }}"
+          files: |
+            dist/ZeroGram-arm64-v8a.apk
+            dist/ZeroGram-arm64-v8a-debug.apk
